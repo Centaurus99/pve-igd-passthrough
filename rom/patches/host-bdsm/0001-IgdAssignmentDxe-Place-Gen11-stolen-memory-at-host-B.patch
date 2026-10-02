@@ -1,0 +1,193 @@
+From bb1ab5054ce4c29da229918ad3be2b983df28bc2 Mon Sep 17 00:00:00 2001
+From: Centaurus99 <haix.tong@gmail.com>
+Date: Sat, 3 Oct 2026 02:28:52 +0800
+Subject: [PATCH] IgdAssignmentDxe: Place Gen11+ stolen memory at host BDSM
+ address
+
+Gen11+ IGD hardware keeps accessing the stolen reserved area (BAR0 +
+0x1082C0, STOLEN_RESERVED) by host physical address, and that register is
+not virtualized. When guest stolen memory is placed elsewhere, the guest
+driver finds the reserved area outside stolen memory and the device DMA
+into it targets unrelated guest addresses.
+
+Derive the host stolen memory base from BGSM (BAR0 + 0x108100) plus the
+GSM size from GGC.GGMS, and allocate guest stolen memory at the same
+address. Fall back to the existing dynamic allocation if that range is not
+available in the guest.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ IgdAssignmentDxe/IgdAssignment.c | 150 +++++++++++++++++++++++++++++--
+ 1 file changed, 144 insertions(+), 6 deletions(-)
+
+diff --git a/IgdAssignmentDxe/IgdAssignment.c b/IgdAssignmentDxe/IgdAssignment.c
+index bd0fbbf..2d727d4 100644
+--- a/IgdAssignmentDxe/IgdAssignment.c
++++ b/IgdAssignmentDxe/IgdAssignment.c
+@@ -346,6 +346,119 @@ FreeOpRegion:
+ }
+ 
+ 
++#define IGD_PCI_GGC_OFFSET               0x50
++#define IGD_GGC_GGMS_SHIFT               6
++#define IGD_GGC_GGMS_MASK                0x3
++#define IGD_MMIO_BGSM_OFFSET             0x108100
++#define IGD_MMIO_STOLEN_RESERVED_OFFSET  0x1082C0
++
++/**
++  Derive the host stolen memory base for the device identified by PciIo.
++
++  QEMU emulates BDSM, but the GSM base register in BAR0 still reports the host
++  address. On Intel platforms DSM sits directly above GSM, so the host DSM base
++  is BGSM + GSM size (GGC.GGMS).
++
++  @param[in] PciIo     The device to query.
++
++  @param[out] Address  Host stolen memory base.
++
++  @retval EFI_SUCCESS    Address has been derived.
++
++  @retval EFI_NOT_FOUND  GSM base or size is not available.
++
++  @return                Error codes from PciIo.
++**/
++STATIC
++EFI_STATUS
++GetHostStolenBase (
++  IN  EFI_PCI_IO_PROTOCOL  *PciIo,
++  OUT EFI_PHYSICAL_ADDRESS *Address
++  )
++{
++  EFI_STATUS Status;
++  UINT64     OrigAttributes;
++  UINT16     Ggc;
++  UINT64     Bgsm;
++  UINT64     StolenReserved;
++  UINT64     GsmSize;
++
++  Status = PciIo->Pci.Read (
++                        PciIo,
++                        EfiPciIoWidthUint16,
++                        IGD_PCI_GGC_OFFSET,
++                        1,                    // Count
++                        &Ggc
++                        );
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = PciIo->Attributes (
++                    PciIo,
++                    EfiPciIoAttributeOperationGet,
++                    0,
++                    &OrigAttributes
++                    );
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++  Status = PciIo->Attributes (
++                    PciIo,
++                    EfiPciIoAttributeOperationEnable,
++                    EFI_PCI_IO_ATTRIBUTE_MEMORY,
++                    NULL
++                    );
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  Status = PciIo->Mem.Read (
++                        PciIo,
++                        EfiPciIoWidthUint64,
++                        0,                    // BarIndex
++                        IGD_MMIO_BGSM_OFFSET,
++                        1,                    // Count
++                        &Bgsm
++                        );
++  if (!EFI_ERROR (Status)) {
++    Status = PciIo->Mem.Read (
++                          PciIo,
++                          EfiPciIoWidthUint64,
++                          0,                    // BarIndex
++                          IGD_MMIO_STOLEN_RESERVED_OFFSET,
++                          1,                    // Count
++                          &StolenReserved
++                          );
++  }
++  PciIo->Attributes (
++           PciIo,
++           EfiPciIoAttributeOperationSet,
++           OrigAttributes,
++           NULL
++           );
++  if (EFI_ERROR (Status)) {
++    return Status;
++  }
++
++  GsmSize = (Ggc >> IGD_GGC_GGMS_SHIFT) & IGD_GGC_GGMS_MASK;
++  if (GsmSize != 0) {
++    GsmSize = SIZE_1MB << GsmSize;
++  }
++  Bgsm &= ~(UINT64)(SIZE_1MB - 1);
++  if (Bgsm == 0 || GsmSize == 0) {
++    return EFI_NOT_FOUND;
++  }
++
++  *Address = Bgsm + GsmSize;
++
++  DEBUG ((DEBUG_INFO, "%a: host BGSM 0x%Lx GSM %Lu MB -> BDSM 0x%Lx, "
++    "STOLEN_RESERVED 0x%Lx\n", __FUNCTION__, Bgsm, GsmSize / SIZE_1MB,
++    *Address, StolenReserved));
++  return EFI_SUCCESS;
++}
++
++
+ /**
+   Set up stolen memory for the device identified by PciIo.
+ 
+@@ -382,12 +495,37 @@ SetupStolenMemory (
+ 
+   BdsmPages = EFI_SIZE_TO_PAGES (Size);
+ 
+-  Status = Allocate32BitAlignedPagesWithType (
+-             EfiReservedMemoryType,
+-             BdsmPages,
+-             EFI_SIZE_TO_PAGES ((UINTN)ASSIGNED_IGD_BDSM_ALIGN),
+-             &Address
+-             );
++  //
++  // Gen11+ hardware keeps using host physical addresses inside the stolen
++  // reserved area (STOLEN_RESERVED is not relocated), so try to place guest
++  // stolen memory at the host address first.
++  //
++  Status = EFI_UNSUPPORTED;
++  if (PciInfo->Private->Flags & IGD_FLAG_BDSM_64BIT) {
++    Status = GetHostStolenBase (PciIo, &Address);
++    if (!EFI_ERROR (Status)) {
++      Status = gBS->AllocatePages (
++                      AllocateAddress,
++                      EfiReservedMemoryType,
++                      BdsmPages,
++                      &Address
++                      );
++      if (EFI_ERROR (Status)) {
++        DEBUG ((DEBUG_WARN, "%a: %a: stolen memory @ host address 0x%Lx "
++          "unavailable: %r\n", __FUNCTION__, GetPciName (PciInfo), Address,
++          Status));
++      }
++    }
++  }
++
++  if (EFI_ERROR (Status)) {
++    Status = Allocate32BitAlignedPagesWithType (
++               EfiReservedMemoryType,
++               BdsmPages,
++               EFI_SIZE_TO_PAGES ((UINTN)ASSIGNED_IGD_BDSM_ALIGN),
++               &Address
++               );
++  }
+   if (EFI_ERROR (Status)) {
+     DEBUG ((DEBUG_ERROR, "%a: %a: failed to allocate stolen memory: %r\n",
+       __FUNCTION__, GetPciName (PciInfo), Status));
+-- 
+2.25.1
+

@@ -1,0 +1,3 @@
+[submodule "rom/VfioIgdPkg"]
+	path = rom/VfioIgdPkg
+	url = https://github.com/tomitamoeko/VfioIgdPkg.git

@@ -1,0 +1,6 @@
+work/
+rom/local/
+*.efi
+*.rom
+*.deb
+!rom/prebuilt/*.rom
